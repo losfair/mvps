@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package mvps.blob;
+
+message BlobHeader {
+  int32 version = 1;
+  repeated int64 page_ids_delta_encoded = 2;
+  repeated int64 page_compressed_sizes_delta_encoded = 3;
+  string metadata = 4;
+}
+
+enum BlobPageCompressionMethod {
+  BPCM_UNSPECIFIED = 0;
+  BPCM_NONE = 1;
+  BPCM_ZSTD = 2;
+}
+
+message BlobPage {
+  BlobPageCompressionMethod compression = 1;
+  bytes data = 2;
+}

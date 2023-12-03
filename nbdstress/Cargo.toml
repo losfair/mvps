@@ -1,0 +1,20 @@
+[package]
+name = "nbdstress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+bytestring = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+rpds = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

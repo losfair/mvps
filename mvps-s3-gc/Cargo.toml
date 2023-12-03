@@ -1,0 +1,37 @@
+[package]
+name = "mvps-s3-gc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+blake3 = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+bytestring = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+humansize = { workspace = true }
+itertools = { workspace = true }
+jsonwebtoken = { workspace = true }
+memmap2 = { workspace = true }
+moka = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rpds = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slab = { workspace = true }
+tempfile = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zstd = { workspace = true }

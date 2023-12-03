@@ -1,0 +1,45 @@
+[package]
+name = "mvps-te"
+version = "0.1.0"
+edition = "2021"
+description = "MVPS transaction engine"
+
+[dependencies]
+mvps-blob = { path = "../mvps-blob" }
+mvps-proto = { path = "../mvps-proto" }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+blake3 = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+bytestring = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+governor = { workspace = true }
+heed = { workspace = true }
+humansize = { workspace = true }
+jsonwebtoken = { workspace = true }
+memmap2 = { workspace = true }
+moka = { workspace = true }
+prost = { workspace = true }
+rand = { workspace = true }
+rpds = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+slab = { workspace = true }
+tempfile = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempdir = { workspace = true }
+tracing-test = { workspace = true }
