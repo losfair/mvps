@@ -52,6 +52,10 @@ struct Args {
   /// Reconnect interval in milliseconds. 0 means no reconnect. A 10% jitter is added.
   #[clap(long, default_value = "0", env = "NBD_STRESS_RECONNECT_INTERVAL_MS")]
   reconnect_interval_ms: u64,
+
+  /// Stop after the given number of reads. 0 means never stop.
+  #[clap(long, default_value = "0", env = "NBD_STRESS_STOP_AFTER_READS")]
+  stop_after_reads: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -334,6 +338,10 @@ async fn async_main() -> anyhow::Result<()> {
       new_writes = metrics.total_writes - prev_metrics.total_writes,
       "metrics"
     );
+    if metrics.total_reads >= args.stop_after_reads {
+      tracing::info!("stopping because stop_after_reads is reached");
+      return Ok(());
+    }
     prev_metrics = metrics;
   }
 }
