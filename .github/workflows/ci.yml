@@ -37,44 +37,6 @@ jobs:
         with:
           name: build
           path: ./build
-  build-aarch64:
-    name: Build (AArch64)
-    runs-on: ubuntu-20.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          target: aarch64-unknown-linux-gnu
-      - name: Install system dependencies
-        run: sudo apt-get install -y protobuf-compiler
-      - name: Install cargo-zigbuild
-        run: pip3 install cargo-zigbuild
-      - name: Rust Build Cache
-        uses: Swatinem/rust-cache@v2
-      - name: Build (mvps-te)
-        run: cargo zigbuild --locked --release -p mvps-te --target aarch64-unknown-linux-gnu.2.19
-      - name: Build (mvps-s3-gc)
-        run: cargo zigbuild --locked --release -p mvps-s3-gc --target aarch64-unknown-linux-gnu.2.19
-      - name: Build (nbdstress)
-        run: cargo zigbuild --locked --release -p nbdstress --target aarch64-unknown-linux-gnu.2.19
-      - name: Collect binaries
-        run: |
-          set -e
-          mkdir build
-          cd build
-          cp ../target/aarch64-unknown-linux-gnu/release/mvps-te ./
-          cp ../target/aarch64-unknown-linux-gnu/release/mvps-s3-gc ./
-          cp ../target/aarch64-unknown-linux-gnu/release/nbdstress ./
-          find . -type f -exec sha256sum '{}' ';'
-      - name: Push binaries
-        uses: actions/upload-artifact@v3
-        with:
-          name: build-aarch64
-          path: ./build
   test:
     name: test
     runs-on: ubuntu-20.04
@@ -92,11 +54,46 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --locked
+  nbdstress:
+    name: nbdstress
+    runs-on: ubuntu-20.04
+    needs:
+    - build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Fetch binaries
+        uses: actions/download-artifact@v3
+        with:
+          name: build
+          path: ./build
+      - name: Run it
+        env:
+          MVPS_TE_JWT_SECRET: github-actions
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1
+          S3_ENDPOINT: https://33ec30ecf17c12fd7704767077b686a3.r2.cloudflarestorage.com
+        run: |
+          set -e
+          export MVPS_TE_ROOT_KEY=xchacha20poly1305:$(openssl rand -base64 32)
+          chmod +x ./build/mvps-te ./build/mvps-s3-gc ./build/nbdstress
+          export RUST_LOG=info
+          ./build/mvps-te \
+            --listen 127.0.0.1:10809 \
+            --image-store s3 \
+            --image-store-s3-bucket mvps-github-actions \
+            --image-store-s3-prefix ci-$(date -u "+%Y%m%d-%H%M%S")-$(openssl rand -hex 16)/ \
+            --buffer-store-path /tmp/mvps-buffer &
+          ./build/nbdstress \
+            --export-name eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpbWFnZV9pZCI6IlNUUkVTUy0wMS5tdnBzLWltYWdlIiwiaW1hZ2Vfc2l6ZSI6MjE0NzQ4MzY0OCwicGFnZV9zaXplX2JpdHMiOjEyLCJleHAiOjMwMDAwMDAwMDAsImNsaWVudF9pZCI6ImM5ZWZkOTZjLWRhNTktNDM1MS1iMzExLTM1MTI5NWZhOThlMiJ9.HjCMh3inem9WFLmPy0HOJlefD1dFxcH9YMqOLsz6R-E \
+            --remote 127.0.0.1:10809 \
+            --write-percentage 0.2 --reconnect-interval-ms 10000 \
+            --stop-after-reads 1000000
   release:
     name: Release
     needs:
     - build
-    - build-aarch64
     - test
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-20.04
@@ -105,10 +102,6 @@ jobs:
       with:
         name: build
         path: ./build
-    - uses: actions/download-artifact@v3
-      with:
-        name: build-aarch64
-        path: ./build-aarch64
     - uses: softprops/action-gh-release@v1
       with:
         files: |
