@@ -6,11 +6,12 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use bytestring::ByteString;
 use futures::{stream::FuturesOrdered, Stream, TryStreamExt};
-use memmap2::{MmapMut, MmapOptions};
+use memmap2::{MmapOptions, MmapRaw};
 use mvps_blob::interfaces::{ImageInfo, ImageStore, RemoteBlob, RemoteBlobMetadata};
+use rand::Rng;
 use slab::Slab;
 
 use crate::io_planner::IoPlannerIterator;
@@ -20,39 +21,53 @@ pub struct CachingImageStore {
   block_size: u64,
   cache: moka::future::Cache<(ByteString, u64), Arc<MappedHandle>>, // (blob_id, block_id) -> mapped_id
 
-  mapped_cache: Arc<Mutex<MappedCache>>,
+  mapped_cache: Arc<MappedCache>,
 }
 
 struct MappedHandle {
-  mapped_cache: Arc<Mutex<MappedCache>>,
+  mapped_cache: Arc<MappedCache>,
   mapped_id: usize,
 }
 
 impl Drop for MappedHandle {
   fn drop(&mut self) {
-    let mut mapped = self.mapped_cache.lock().unwrap();
-    mapped.alloc.remove(self.mapped_id);
+    self
+      .mapped_cache
+      .alloc
+      .lock()
+      .unwrap()
+      .remove(self.mapped_id);
   }
 }
 
 impl MappedHandle {
-  fn read(&self, range: Range<u64>) -> Bytes {
-    let mut output = BytesMut::with_capacity(range.clone().count());
-    self.read_to(range, &mut output);
-    output.freeze()
-  }
+  async fn read(&self, range: Range<u64>) -> Vec<u8> {
+    let mapped_cache = self.mapped_cache.clone();
+    let read_offset = self.mapped_id * self.mapped_cache.block_size as usize + range.start as usize;
 
-  fn read_to(&self, range: Range<u64>, output: &mut BytesMut) {
-    let mapped = self.mapped_cache.lock().unwrap();
-    let slice = &mapped.mapping
-      [self.mapped_id * mapped.block_size as usize + range.start as usize..][..range.count()];
-    output.extend_from_slice(slice);
+    let data = tokio::task::spawn_blocking(move || {
+      let range_len = range.clone().count();
+      let mut output = Vec::with_capacity(range_len);
+      unsafe {
+        assert!(read_offset.saturating_add(range_len) <= mapped_cache.mapping.len());
+        std::ptr::copy_nonoverlapping(
+          mapped_cache.mapping.as_ptr().offset(read_offset as isize),
+          output.as_mut_ptr(),
+          range_len,
+        );
+        output.set_len(range_len);
+      }
+      output
+    })
+    .await
+    .unwrap();
+    data
   }
 }
 
 struct MappedCache {
-  mapping: MmapMut,
-  alloc: Slab<()>,
+  mapping: MmapRaw,
+  alloc: Mutex<Slab<()>>,
   block_size: usize,
 }
 
@@ -76,14 +91,14 @@ impl CachingImageStore {
 
     let mapping_file = tempfile::tempfile()?;
     mapping_file.set_len(mapped_cache_size_blocks * config.block_size)?;
-    let mapping = unsafe { MmapOptions::new().map_mut(&mapping_file)? };
+    let mapping = MmapOptions::new().map_raw(&mapping_file)?;
     drop(mapping_file);
 
-    let mapped_cache = Arc::new(Mutex::new(MappedCache {
+    let mapped_cache = Arc::new(MappedCache {
       mapping,
-      alloc: Slab::with_capacity(mapped_cache_size_blocks as usize),
+      alloc: Mutex::new(Slab::with_capacity(mapped_cache_size_blocks as usize)),
       block_size: config.block_size as usize,
-    }));
+    });
     let block_size = config.block_size;
 
     Ok(Self {
@@ -139,9 +154,9 @@ impl RemoteBlob for CachingBlob {
     self.inner.read_metadata().await
   }
 
-  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Bytes> {
+  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Vec<u8>> {
     if file_offset_range.is_empty() {
-      return Ok(Bytes::new());
+      return Ok(vec![]);
     }
 
     let it = IoPlannerIterator::new(self.store.block_size, file_offset_range.clone());
@@ -159,25 +174,56 @@ impl RemoteBlob for CachingBlob {
             assert_eq!(data.len(), self.store.block_size as usize);
             let mut attempts = 0u64;
             loop {
-              let mut mapped_cache = self.store.mapped_cache.lock().unwrap();
-              if mapped_cache.alloc.len() == mapped_cache.alloc.capacity() {
-                drop(mapped_cache);
-                if attempts >= 3 {
+              let mut alloc = self.store.mapped_cache.alloc.lock().unwrap();
+              if alloc.len() == alloc.capacity() {
+                drop(alloc);
+                if attempts >= 20 {
                   tracing::warn!(attempts, "mapped cache full, backing off");
                 }
                 attempts += 1;
                 self.store.cache.run_pending_tasks().await;
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                  100 + rand::thread_rng().gen_range(0..100),
+                ))
+                .await;
                 continue;
               }
 
-              let mapped_id = mapped_cache.alloc.insert(());
-              mapped_cache.mapping[mapped_id * self.store.block_size as usize..][..data.len()]
-                .copy_from_slice(&data);
-              break Ok::<_, String>(Arc::new(MappedHandle {
+              let mapped_id = alloc.insert(());
+
+              // Cache entry should be deallocated if subsequent async operations are cancelled
+              let handle = Arc::new(MappedHandle {
                 mapped_cache: self.store.mapped_cache.clone(),
                 mapped_id,
-              }));
+              });
+              drop(alloc);
+
+              let write_offset = mapped_id * self.store.block_size as usize;
+              let handle2 = handle.clone();
+
+              tokio::task::spawn_blocking(move || {
+                unsafe {
+                  assert!(
+                    write_offset.saturating_add(data.len()) <= handle2.mapped_cache.mapping.len()
+                  );
+                  std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    handle2
+                      .mapped_cache
+                      .mapping
+                      .as_mut_ptr()
+                      .offset(write_offset as isize),
+                    data.len(),
+                  );
+                }
+
+                // Hold the handle until memcpy completes
+                drop(handle2);
+              })
+              .await
+              .unwrap();
+
+              break Ok::<_, String>(handle);
             }
           })
           .await
@@ -191,18 +237,21 @@ impl RemoteBlob for CachingBlob {
     // Fast path for one block
     if blocks.len() == 1 {
       let (block, range) = blocks.into_iter().next().unwrap();
-      return Ok(block.read(range));
+      return Ok(block.read(range).await);
     }
 
-    let mut result = BytesMut::with_capacity(file_offset_range.clone().count() as usize);
+    let file_offset_range_2 = file_offset_range.clone();
+    let mut result = Vec::with_capacity(file_offset_range_2.count() as usize);
     for (block, range) in blocks {
-      block.read_to(range, &mut result);
+      let data = block.read(range).await;
+      result.extend_from_slice(&data[..]);
     }
+
     assert_eq!(result.len(), file_offset_range.count() as usize);
-    Ok(result.freeze())
+    Ok(result)
   }
 
-  async fn stream_chunks(
+  async fn stream_raw_chunks(
     self: Rc<Self>,
     file_offset_start: u64,
     chunk_sizes: Vec<u64>,
@@ -210,7 +259,7 @@ impl RemoteBlob for CachingBlob {
     self
       .inner
       .clone()
-      .stream_chunks(file_offset_start, chunk_sizes)
+      .stream_raw_chunks(file_offset_start, chunk_sizes)
       .await
   }
 }

@@ -416,7 +416,7 @@ async fn read_object(client: &Client, bucket: &str, key: &str) -> anyhow::Result
   Ok(Some(buf))
 }
 
-/// Image keys have the format of `image_id/[seq].json`. This method groups all provided
+/// Image keys have the format of `image_id/[seq]-[writer_id].json`. This method groups all provided
 /// image keys by `image_id`.
 fn group_images_by_id(images: impl Iterator<Item = ObjectInfo>) -> Vec<(Bytes, Vec<ObjectInfo>)> {
   images

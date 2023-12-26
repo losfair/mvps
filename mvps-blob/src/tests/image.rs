@@ -26,6 +26,7 @@ async fn test_create_and_read_image() {
       (5, Some(Bytes::from("some-data"))),
       (10, Some(Bytes::from("other-data"))),
     ],
+    None,
   )
   .await
   .unwrap()
@@ -33,6 +34,7 @@ async fn test_create_and_read_image() {
   let blob2: ByteString = create_blob(
     &*image_store,
     &mut [(2, Some(Bytes::from("bob"))), (5, None)],
+    None,
   )
   .await
   .unwrap()
@@ -62,13 +64,13 @@ async fn test_create_and_read_image() {
   }
 
   let image_id = ByteString::from(generate_image_id());
-  let mut image = ImageManager::open(image_store.clone(), image_id.clone())
+  let mut image = ImageManager::open(image_store.clone(), image_id.clone(), &[])
     .await
     .unwrap();
   image
     .push_layer(
       blob1.clone(),
-      BlobReader::open(image_store.clone().get_blob(&blob1).await.unwrap())
+      BlobReader::open(image_store.clone().get_blob(&blob1).await.unwrap(), &[])
         .await
         .unwrap(),
     )
@@ -76,7 +78,7 @@ async fn test_create_and_read_image() {
   image
     .push_layer(
       blob2.clone(),
-      BlobReader::open(image_store.clone().get_blob(&blob2).await.unwrap())
+      BlobReader::open(image_store.clone().get_blob(&blob2).await.unwrap(), &[])
         .await
         .unwrap(),
     )
@@ -87,6 +89,6 @@ async fn test_create_and_read_image() {
   image.write_back().await.unwrap();
   drop(image);
 
-  let image = ImageManager::open(image_store, image_id).await.unwrap();
+  let image = ImageManager::open(image_store, image_id, &[]).await.unwrap();
   assert_image_ok(&image).await;
 }

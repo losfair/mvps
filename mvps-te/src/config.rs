@@ -41,9 +41,21 @@ impl Default for LayeredStoreConfig {
           pressure_level: 8,
         },
         CompactionThreshold {
+          max_input_size: 256 * 1024,
+          min_output_size: 512 * 1024,
+          max_output_size: 8 * 1024 * 1024,
+          pressure_level: 8,
+        },
+        CompactionThreshold {
           max_input_size: 8 * 1024 * 1024,
           min_output_size: 32 * 1024 * 1024,
           max_output_size: 128 * 1024 * 1024,
+          pressure_level: 16,
+        },
+        CompactionThreshold {
+          max_input_size: 32 * 1024 * 1024,
+          min_output_size: 128 * 1024 * 1024,
+          max_output_size: 512 * 1024 * 1024,
           pressure_level: 16,
         },
         CompactionThreshold {

@@ -14,6 +14,9 @@ pub struct ImageInfo {
   pub change_count: u64,
 
   #[serde(default)]
+  pub writer_id: Option<ByteString>,
+
+  #[serde(default)]
   pub layers: Vec<ByteString>,
 }
 
@@ -32,8 +35,8 @@ pub trait ImageStore {
 #[async_trait(?Send)]
 pub trait RemoteBlob {
   async fn read_metadata(&self) -> anyhow::Result<RemoteBlobMetadata>;
-  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Bytes>;
-  async fn stream_chunks(
+  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Vec<u8>>;
+  async fn stream_raw_chunks(
     self: Rc<Self>,
     file_offset_start: u64,
     chunk_sizes: Vec<u64>,

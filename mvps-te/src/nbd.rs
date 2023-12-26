@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, pin::Pin};
+use std::pin::Pin;
 
 use bytestring::ByteString;
 use jsonwebtoken::DecodingKey;
@@ -8,7 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub struct EstablishedConn {
   pub io_rh: Pin<Box<dyn AsyncRead + Send + 'static>>,
   pub io_wh: Pin<Box<dyn AsyncWrite + Send + 'static>>,
-  pub remote_addr: SocketAddr,
+  pub remote_addr: ByteString,
   pub image_id: ByteString,
   pub client_id: Option<ByteString>,
   pub page_size_bits: u32,
@@ -29,7 +29,7 @@ struct HandshakeClaims {
 pub async fn handshake(
   mut rh: Pin<Box<dyn AsyncRead + Send + 'static>>,
   mut wh: Pin<Box<dyn AsyncWrite + Send + 'static>>,
-  remote_addr: SocketAddr,
+  remote_addr: ByteString,
   get_options: impl FnOnce(ByteString) -> Option<DeviceOptions>,
   jwt_decoding_key: &DecodingKey,
 ) -> anyhow::Result<EstablishedConn> {

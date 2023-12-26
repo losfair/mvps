@@ -25,6 +25,7 @@ async fn test_create_and_read_blob() {
       (2, Some(Bytes::from("world"))),
       (5, None),
     ],
+    None,
   )
   .await
   .unwrap();
@@ -36,7 +37,7 @@ async fn test_create_and_read_blob() {
       .len()
   );
 
-  let reader = BlobReader::open(image_store.get_blob(&blob_id).await.unwrap())
+  let reader = BlobReader::open(image_store.get_blob(&blob_id).await.unwrap(), &[])
     .await
     .unwrap();
   assert_eq!(
@@ -69,29 +70,31 @@ async fn test_compact_blobs() {
       (5, Some(Bytes::from("some-data"))),
       (10, Some(Bytes::from("other-data"))),
     ],
+    None,
   )
   .await
   .unwrap();
   let blob2 = create_blob(
     &*image_store,
     &mut [(2, Some(Bytes::from("bob"))), (5, None)],
+    None,
   )
   .await
   .unwrap();
-  let reader1 = BlobReader::open(image_store.clone().get_blob(&blob1).await.unwrap())
+  let reader1 = BlobReader::open(image_store.clone().get_blob(&blob1).await.unwrap(), &[])
     .await
     .unwrap();
-  let reader2 = BlobReader::open(image_store.clone().get_blob(&blob2).await.unwrap())
+  let reader2 = BlobReader::open(image_store.clone().get_blob(&blob2).await.unwrap(), &[])
     .await
     .unwrap();
 
-  let output = compact_blobs(vec![reader1, reader2], "".into())
+  let output = compact_blobs(vec![reader1, reader2], "".into(), None)
     .await
     .unwrap();
   let output_blob_id = generate_blob_id();
   image_store.set_blob(&output_blob_id, output).await.unwrap();
 
-  let reader = BlobReader::open(image_store.get_blob(&output_blob_id).await.unwrap())
+  let reader = BlobReader::open(image_store.get_blob(&output_blob_id).await.unwrap(), &[])
     .await
     .unwrap();
   assert_eq!(

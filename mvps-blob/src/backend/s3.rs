@@ -87,6 +87,7 @@ impl ImageStore for S3ImageStore {
       return Ok(ImageInfo {
         version: 1,
         change_count: 0,
+        writer_id: None,
         layers: vec![],
       });
     };
@@ -120,8 +121,11 @@ impl ImageStore for S3ImageStore {
       .put_object()
       .bucket(&*self.bucket)
       .key(format!(
-        "{}images/{}/{}.json",
-        self.prefix, image_id, change_count_suffix
+        "{}images/{}/{}-{}.json",
+        self.prefix,
+        image_id,
+        change_count_suffix,
+        info.writer_id.as_deref().unwrap_or_default()
       ))
       .body(ByteStream::from(serialized_info))
       .send()
@@ -151,7 +155,7 @@ impl ImageStore for S3ImageStore {
     blob_id: &str,
     blob_stream: Pin<Box<dyn Stream<Item = anyhow::Result<Bytes>> + Send + 'static>>,
   ) -> anyhow::Result<()> {
-    const PART_SIZE: usize = 32 * 1024 * 1024;
+    const PART_SIZE: usize = 16 * 1024 * 1024;
 
     let client = self.s3_client.clone();
     let bucket = self.bucket.clone();
@@ -170,41 +174,46 @@ impl ImageStore for S3ImageStore {
         .upload_id()
         .ok_or_else(|| anyhow::anyhow!("Failed to get upload ID"))?;
 
-      let mut part_number = 1;
-      let mut completed_parts = Vec::new();
-
-      let mut chunks = blob_stream
+      let chunks = blob_stream
         .flat_map(|x| match x {
           Ok(x) => Either::Left(futures::stream::iter(x.into_iter().map(Ok))),
           Err(e) => Either::Right(futures::stream::once(futures::future::ready(Err(e)))),
         })
         .try_chunks(PART_SIZE);
 
-      while let Some(chunk) = chunks.next().await {
-        let chunk = chunk?;
-
-        // Upload the current buffer as a part
-        let resp = client
-          .upload_part()
-          .bucket(&*bucket)
-          .key(&key)
-          .upload_id(upload_id)
-          .part_number(part_number)
-          .body(ByteStream::from(chunk))
-          .send()
-          .await?;
-
-        if let Some(etag) = resp.e_tag {
-          completed_parts.push(
-            CompletedPart::builder()
-              .e_tag(etag)
+      let completed_parts = chunks
+        .enumerate()
+        .map(|(i, x)| x.map(|x| (i + 1, x)))
+        .map_err(anyhow::Error::from)
+        .map_ok(|(part_number, chunk)| {
+          let client = &client;
+          let bucket = &bucket;
+          let key = &key;
+          async move {
+            let resp = client
+              .upload_part()
+              .bucket(&**bucket)
+              .key(key)
+              .upload_id(upload_id)
               .part_number(part_number as i32)
-              .build(),
-          );
-        }
+              .body(ByteStream::from(chunk))
+              .send()
+              .await?;
+            let Some(etag) = resp.e_tag else {
+              anyhow::bail!("Failed to get etag");
+            };
 
-        part_number += 1;
-      }
+            Ok::<_, anyhow::Error>(
+              CompletedPart::builder()
+                .e_tag(etag)
+                .part_number(part_number as i32)
+                .build(),
+            )
+          }
+        })
+        .try_buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
 
       // Complete the multipart upload
       client
@@ -254,10 +263,10 @@ impl RemoteBlob for S3Blob {
     })
   }
 
-  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Bytes> {
+  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Vec<u8>> {
     let requested_len = file_offset_range.end - file_offset_range.start;
     if requested_len == 0 {
-      return Ok(Bytes::new());
+      return Ok(vec![]);
     }
 
     let fetch_len = file_offset_range
@@ -265,7 +274,7 @@ impl RemoteBlob for S3Blob {
       .min(self.metadata.content_length().unwrap_or(0) as u64)
       .saturating_sub(file_offset_range.start);
 
-    let body = loop {
+    let mut body = loop {
       let resp = self
         .s3_client
         .get_object()
@@ -280,7 +289,7 @@ impl RemoteBlob for S3Blob {
         .await?;
 
       match resp.body.collect().await {
-        Ok(x) => break x.into_bytes(),
+        Ok(x) => break x.to_vec(),
         Err(e) => {
           tracing::error!(error = ?e, "read_range failed to receive streaming body from s3, retrying");
         }
@@ -292,16 +301,12 @@ impl RemoteBlob for S3Blob {
 
     if fetch_len < requested_len {
       // pad with zeros
-      let mut output = Vec::with_capacity(requested_len as usize);
-      output.extend_from_slice(&body);
-      output.resize(requested_len as usize, 0);
-      Ok(Bytes::from(output))
-    } else {
-      Ok(body)
+      body.resize(requested_len as usize, 0);
     }
+    Ok(body)
   }
 
-  async fn stream_chunks(
+  async fn stream_raw_chunks(
     self: Rc<Self>,
     file_offset_start: u64,
     chunk_sizes: Vec<u64>,

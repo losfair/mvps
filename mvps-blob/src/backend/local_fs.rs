@@ -33,6 +33,7 @@ impl ImageStore for LocalFsImageStore {
         return Ok(ImageInfo {
           version: 1,
           change_count: 0,
+          writer_id: None,
           layers: vec![],
         });
       }
@@ -88,7 +89,7 @@ impl RemoteBlob for LocalFsBlob {
     })
   }
 
-  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Bytes> {
+  async fn read_range(&self, file_offset_range: Range<u64>) -> anyhow::Result<Vec<u8>> {
     let Some(num_readable_bytes) = file_offset_range
       .end
       .min(self.metadata.len())
@@ -105,10 +106,10 @@ impl RemoteBlob for LocalFsBlob {
       .read_exact(&mut buf[..num_readable_bytes as usize])
       .await?;
     // the rest of the buffer are left zeroed
-    Ok(buf.into())
+    Ok(buf)
   }
 
-  async fn stream_chunks(
+  async fn stream_raw_chunks(
     self: Rc<Self>,
     file_offset_start: u64,
     chunk_sizes: Vec<u64>,

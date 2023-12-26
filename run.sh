@@ -5,6 +5,7 @@ set -e
 export RUST_LOG=info
 export MVPS_TE_JWT_SECRET="insecure_token"
 export TMPDIR="/tmp/mvpstest"
+export MVPS_TE_ROOT_KEY="xchacha20poly1305:qpy7OFKzgJZ2f1xm733LvWHPTl+6V0yNY8VFNjOOFas="
 
 if [ "$1" == "s3" ]; then
   export AWS_ACCESS_KEY_ID=minioadmin

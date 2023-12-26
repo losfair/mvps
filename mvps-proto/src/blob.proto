@@ -7,6 +7,7 @@ message BlobHeader {
   repeated int64 page_ids_delta_encoded = 2;
   repeated int64 page_compressed_sizes_delta_encoded = 3;
   string metadata = 4;
+  bytes v2_encrypted_data_encryption_key = 5;
 }
 
 enum BlobPageCompressionMethod {

@@ -10,12 +10,28 @@ mod session_manager;
 #[cfg(test)]
 mod tests;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+  pin::Pin,
+  str::FromStr,
+  sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+  },
+  time::Duration,
+};
 
+use anyhow::Context;
+use bytestring::ByteString;
 use clap::Parser;
+use futures::future::Either;
 use heed::{flags::Flags, EnvOpenOptions};
 use jsonwebtoken::DecodingKey;
-use tokio::net::TcpListener;
+use mvps_blob::blob_crypto::{CryptoRootKey, SubkeyAlgorithm};
+use tokio::{
+  io::{AsyncRead, AsyncWrite},
+  net::{TcpListener, UnixListener},
+  signal::unix::{signal, SignalKind},
+};
 use tracing_subscriber::{fmt::SubscriberBuilder, EnvFilter};
 
 use crate::{
@@ -35,7 +51,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 struct Args {
   /// Listen address
   #[clap(long, default_value = "127.0.0.1:10809", env = "MVPS_TE_LISTEN")]
-  listen: SocketAddr,
+  listen: String,
 
   /// Image store provider. Valid options: local, s3
   #[clap(long, env = "MVPS_TE_IMAGE_STORE")]
@@ -76,6 +92,10 @@ struct Args {
     env = "MVPS_TE_LMDB_MAP_SIZE_BYTES"
   )]
   lmdb_map_size_bytes: usize,
+
+  /// LMDB NOSYNC flag
+  #[clap(long)]
+  lmdb_nosync: bool,
 
   /// JWT secret
   #[clap(long, env = "MVPS_TE_JWT_SECRET")]
@@ -120,6 +140,26 @@ struct Args {
   /// Disable image store write
   #[clap(long)]
   disable_image_store_write: bool,
+
+  /// Root key
+  #[clap(long, env = "MVPS_TE_ROOT_KEY")]
+  root_key: Option<String>,
+
+  /// Comma-separated list of decryption keys (in addition to the root key)
+  #[clap(
+    long,
+    env = "MVPS_TE_DECRYPTION_KEYS",
+    use_value_delimiter = true,
+    value_delimiter = ','
+  )]
+  decryption_keys: Vec<String>,
+
+  #[clap(
+    long,
+    env = "MVPS_TE_SUBKEY_ALGORITHM",
+    default_value = "chacha20poly1305"
+  )]
+  subkey_algorithm: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -171,11 +211,16 @@ async fn async_main() -> anyhow::Result<()> {
     .ok_or_else(|| anyhow::anyhow!("buffer store path is required"))?;
 
   let bs_env = unsafe {
-    EnvOpenOptions::new()
+    let mut opts = EnvOpenOptions::new();
+    opts
       .max_dbs(args.lmdb_max_dbs)
       .max_readers(args.lmdb_max_readers)
       .map_size(args.lmdb_map_size_bytes)
-      .flag(Flags::MdbNoTls)
+      .flag(Flags::MdbNoTls);
+    if args.lmdb_nosync {
+      opts.flag(Flags::MdbNoSync);
+    }
+    opts
   }
   .open(buffer_store_path)
   .map_err(|e| {
@@ -185,7 +230,41 @@ async fn async_main() -> anyhow::Result<()> {
       e
     )
   })?;
-  let nbd_listener = TcpListener::bind(args.listen).await?;
+  let nbd_listener = if let Some(path) = args.listen.strip_prefix("unix:") {
+    let _ = std::fs::remove_file(path);
+    Either::Left(UnixListener::bind(path)?)
+  } else {
+    Either::Right(TcpListener::bind(&args.listen).await?)
+  };
+
+  let root_key: Arc<Option<CryptoRootKey>>;
+  let mut decryption_keys: Vec<CryptoRootKey> = vec![];
+  let subkey_algorithm = SubkeyAlgorithm::from_str(&args.subkey_algorithm)
+    .map_err(|_| anyhow::anyhow!("invalid subkey algorithm: {}", args.subkey_algorithm))?;
+
+  if let Some(x) = &args.root_key {
+    root_key = Arc::new(Some(
+      CryptoRootKey::new(x, subkey_algorithm).with_context(|| "invalid root key")?,
+    ));
+    decryption_keys.push(CryptoRootKey::new(x, subkey_algorithm).unwrap());
+    tracing::info!(
+      "loaded root key with subkey algorithm {:?}",
+      subkey_algorithm
+    );
+  } else {
+    root_key = Arc::new(None);
+  };
+
+  for (i, decryption_key) in args.decryption_keys.iter().enumerate() {
+    decryption_keys.push(
+      CryptoRootKey::new(decryption_key, subkey_algorithm)
+        .with_context(|| format!("invalid decryption key at index {}", i))?,
+    );
+  }
+  if !decryption_keys.is_empty() {
+    tracing::info!(num_keys = decryption_keys.len(), "loaded decryption keys");
+  }
+
   let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
     image_store_provider,
     bs_env: Some(bs_env),
@@ -200,33 +279,89 @@ async fn async_main() -> anyhow::Result<()> {
     image_cache_size: args.image_cache_size_bytes,
     image_cache_block_size: args.image_cache_block_size_bytes,
     write_throttle_threshold_pages: args.write_throttle_threshold_pages,
+    root_key,
+    decryption_keys: Arc::new(decryption_keys),
   }));
   let jwt_decoding_key: &'static DecodingKey = Box::leak(Box::new(DecodingKey::from_secret(
     args.jwt_secret.as_bytes(),
   )));
 
+  // Signal handling & periodic cleanup
+  let is_shutting_down = Arc::new(AtomicBool::new(false));
   {
     let session_manager = session_manager.clone();
-    tokio::spawn(async move {
-      loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        session_manager.cleanup();
-      }
-    });
+    let mut stream = signal(SignalKind::terminate()).unwrap();
+    let is_shutting_down = is_shutting_down.clone();
+    std::thread::Builder::new()
+      .name("mvps-cleanup".into())
+      .spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+          .enable_all()
+          .build()
+          .unwrap();
+        rt.block_on(async {
+          loop {
+            tokio::select! {
+              _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                session_manager.cleanup();
+              }
+              _ = stream.recv() => {
+                tracing::info!("shutting down");
+                is_shutting_down.store(true, Ordering::Relaxed);
+                session_manager.shutdown_blocking();
+                std::process::exit(0);
+              }
+            }
+          }
+        })
+      })
+      .unwrap();
   }
 
   loop {
-    let (conn, remote) = nbd_listener.accept().await?;
-    let (rh, wh) = conn.into_split();
-    let rh = Box::pin(tokio::io::BufReader::new(rh));
-    let wh = Box::pin(tokio::io::BufWriter::new(wh));
+    let (rh, wh, remote): (
+      Pin<Box<dyn AsyncRead + Send>>,
+      Pin<Box<dyn AsyncWrite + Send>>,
+      String,
+    ) = match &nbd_listener {
+      Either::Left(l) => {
+        let (conn, remote) = l.accept().await?;
+        let (rh, wh) = conn.into_split();
+        (
+          Box::pin(tokio::io::BufReader::new(rh)),
+          Box::pin(tokio::io::BufWriter::new(wh)),
+          format!(
+            "unix:{}",
+            remote
+              .as_pathname()
+              .and_then(|x| x.to_str())
+              .unwrap_or_default()
+          ),
+        )
+      }
+      Either::Right(l) => {
+        let (conn, remote) = l.accept().await?;
+        conn.set_nodelay(true)?;
+        let (rh, wh) = conn.into_split();
+        (
+          Box::pin(tokio::io::BufReader::new(rh)),
+          Box::pin(tokio::io::BufWriter::new(wh)),
+          remote.to_string(),
+        )
+      }
+    };
+    let remote = ByteString::from(remote);
     let session_manager = session_manager.clone();
+
+    if is_shutting_down.load(Ordering::Relaxed) {
+      continue;
+    }
 
     tokio::spawn(async move {
       let conn = match handshake(
         rh,
         wh,
-        remote,
+        remote.clone(),
         |_name| Some(DeviceOptions {}),
         jwt_decoding_key,
       )

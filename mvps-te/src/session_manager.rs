@@ -1,7 +1,6 @@
 use std::{
   cell::RefCell,
   collections::HashMap,
-  net::SocketAddr,
   num::NonZeroU32,
   ops::Range,
   path::PathBuf,
@@ -17,7 +16,8 @@ use futures::{future::Either, Future, FutureExt, StreamExt, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use heed::Env;
 use mvps_blob::{
-  backend::local_fs::LocalFsImageStore, interfaces::ImageStore, util::is_valid_image_id,
+  backend::local_fs::LocalFsImageStore, blob_crypto::CryptoRootKey, interfaces::ImageStore,
+  util::is_valid_image_id,
 };
 use rand::Rng;
 use tokio::{
@@ -39,7 +39,7 @@ use crate::{
 };
 
 pub struct SessionManager {
-  sessions: Mutex<HashMap<ByteString, Session>>, // image_id -> session
+  sessions: Mutex<Option<HashMap<ByteString, Session>>>, // image_id -> session
   config: SessionManagerConfig,
 }
 
@@ -52,19 +52,36 @@ pub struct SessionManagerConfig {
   pub image_cache_size: u64,
   pub image_cache_block_size: u64,
   pub write_throttle_threshold_pages: u64,
+  pub root_key: Arc<Option<CryptoRootKey>>,
+  pub decryption_keys: Arc<Vec<CryptoRootKey>>,
 }
 
 impl SessionManager {
   pub fn new(config: SessionManagerConfig) -> Self {
     Self {
-      sessions: Mutex::new(HashMap::new()),
+      sessions: Mutex::new(Some(HashMap::new())),
       config,
     }
   }
 
   pub fn cleanup(&self) {
     let mut sessions = self.sessions.lock().unwrap();
-    sessions.retain(|_, x| !x.handle.is_finished());
+    if let Some(sessions) = &mut *sessions {
+      sessions.retain(|_, x| !x.handle.is_finished());
+    }
+  }
+
+  pub fn shutdown_blocking(&self) {
+    let Some(sessions) = self.sessions.lock().unwrap().take() else {
+      return;
+    };
+
+    // Here `shutdown_tx` of all sessions are dropped
+    let handles = sessions.into_values().map(|x| x.handle).collect::<Vec<_>>();
+
+    for h in handles {
+      let _ = h.join();
+    }
   }
 
   pub fn get_session(&self, image_id: ByteString) -> anyhow::Result<SessionHandle> {
@@ -73,6 +90,9 @@ impl SessionManager {
     }
 
     let mut sessions = self.sessions.lock().unwrap();
+    let Some(sessions) = &mut *sessions else {
+      anyhow::bail!("session manager is shutting down");
+    };
     let session = sessions.entry(image_id.clone()).or_insert_with(|| {
       let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(1);
       let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -85,6 +105,8 @@ impl SessionManager {
         image_cache_size: self.config.image_cache_size,
         image_cache_block_size: self.config.image_cache_block_size,
         write_throttle_threshold_pages: self.config.write_throttle_threshold_pages,
+        root_key: self.config.root_key.clone(),
+        decryption_keys: self.config.decryption_keys.clone(),
       });
       let inner = Arc::new(SessionInner {});
       let handle = std::thread::Builder::new()
@@ -142,6 +164,9 @@ struct SessionConfig {
   image_cache_size: u64,
   image_cache_block_size: u64,
   write_throttle_threshold_pages: u64,
+
+  root_key: Arc<Option<CryptoRootKey>>,
+  decryption_keys: Arc<Vec<CryptoRootKey>>,
 }
 struct SessionInner {}
 
@@ -202,6 +227,8 @@ async fn session_loop(
       config.image_id.clone(),
       config.bs_env.clone(),
       config.layered_store_config.clone(),
+      config.root_key.clone(),
+      config.decryption_keys.clone(),
     )
     .await
     {
@@ -212,14 +239,6 @@ async fn session_loop(
       }
     },
   );
-
-  // Do a checkpoint immediately after recovery because P2D cache is not populated yet and
-  // async checkpoints can cause early transactions to fail
-  if !config.layered_store_config.disable_image_store_write {
-    if let Err(e) = layered_store.request_checkpoint(true).await {
-      tracing::warn!(image_id = %config.image_id, error = ?e, "failed to do initial checkpoint");
-    }
-  }
 
   let periodic_checkpoint_task = {
     let layered_store = layered_store.clone();
@@ -233,14 +252,12 @@ async fn session_loop(
         unreachable!();
       }
 
-      let mut next_deadline = Instant::now() + checkpoint_interval.generate();
-
       loop {
-        tokio::time::sleep_until(next_deadline.into()).await;
-        next_deadline = Instant::now() + checkpoint_interval.generate();
+        let next_deadline = Instant::now() + checkpoint_interval.generate();
         if let Err(e) = layered_store.request_checkpoint(true).await {
           tracing::error!(%image_id, error = ?e, "failed to request checkpoint");
         }
+        tokio::time::sleep_until(next_deadline.into()).await;
       }
     })
   };
@@ -294,7 +311,7 @@ async fn session_loop(
       let client_id = conn.client_id.clone();
       with_interrupt(
         shutdown_rx.clone(),
-        conn.remote_addr,
+        conn.remote_addr.clone(),
         conn.image_id.clone(),
         "conn_loop",
         None,
@@ -343,6 +360,14 @@ async fn session_loop(
 
   let layered_store =
     Rc::into_inner(layered_store).expect("layered_store unique ownership violation");
+
+  let fsync_start = Instant::now();
+  if let Err(e) = layered_store.fsync().await {
+    tracing::error!(image_id = %config.image_id, error = ?e, "failed to fsync");
+  } else {
+    tracing::info!(image_id = %config.image_id, duration = ?fsync_start.elapsed(), "fsync completed");
+  }
+
   if let Err(e) = layered_store.request_checkpoint(true).await {
     tracing::error!(image_id = %config.image_id, error = ?e, "failed to request checkpoint");
   }
@@ -371,7 +396,7 @@ async fn conn_loop(
 
   spawn_local(with_interrupt(
     shutdown_rx.clone(),
-    conn.remote_addr,
+    conn.remote_addr.clone(),
     conn.image_id.clone(),
     "buffered_write_loop",
     Some(wh.clone()),
@@ -427,7 +452,7 @@ async fn conn_loop(
       let explicit_txn = explicit_txn.clone();
       spawn_local(with_interrupt(
         shutdown_rx.clone(),
-        conn.remote_addr,
+        conn.remote_addr.clone(),
         conn.image_id.clone(),
         "async_read",
         Some(wh.clone()),
@@ -436,7 +461,7 @@ async fn conn_loop(
           let _permit = permit;
           let txn = match &explicit_txn {
             Some(x) => Either::Left(x.read().await),
-            None => Either::Right(layered_store.begin_txn()?),
+            None => Either::Right(layered_store.begin_txn().await?),
           };
           let txn = match &txn {
             Either::Left(x) => match &**x {
@@ -450,9 +475,17 @@ async fn conn_loop(
               |(page_id, range)| {
                 let empty_page = empty_page.clone();
                 txn.read_page(page_id).map(move |x| {
-                  x.map(|x| {
-                    x.unwrap_or(empty_page)
-                      .slice(range.start as usize..range.end as usize)
+                  x.and_then(|x| {
+                    let page = x.unwrap_or(empty_page);
+                    if page.len() != 1 << conn.page_size_bits {
+                      anyhow::bail!(
+                        "page size mismatch: page_id={}, actual={}, requested={}",
+                        page_id,
+                        page.len(),
+                        1 << conn.page_size_bits
+                      );
+                    }
+                    Ok(page.slice(range.start as usize..range.end as usize))
                   })
                 })
               },
@@ -480,7 +513,7 @@ async fn conn_loop(
       if !write_is_limited {
         if rand::thread_rng().gen_range(0..100) == 0 {
           // Throttle if buffer store has too many entries that are not yet checkpointed
-          let buffer_store_size = layered_store.buffer_store_size()?;
+          let buffer_store_size = layered_store.buffer_store_size().await?;
           write_is_limited = buffer_store_size >= config.write_throttle_threshold_pages;
           if write_is_limited {
             tracing::warn!(image_id = %conn.image_id, buffer_store_size, "write throttle enabled");
@@ -488,8 +521,7 @@ async fn conn_loop(
           }
         }
       } else {
-        let buffer_store_size = layered_store.buffer_store_size()?;
-        tokio::task::yield_now().await;
+        let buffer_store_size = layered_store.buffer_store_size().await?;
         write_is_limited = buffer_store_size >= config.write_throttle_threshold_pages;
         if !write_is_limited {
           tracing::warn!(image_id = %conn.image_id, buffer_store_size, "write throttle disabled");
@@ -501,7 +533,7 @@ async fn conn_loop(
 
       spawn_local(with_interrupt(
         shutdown_rx.clone(),
-        conn.remote_addr,
+        conn.remote_addr.clone(),
         conn.image_id.clone(),
         "async_write",
         Some(wh.clone()),
@@ -527,7 +559,11 @@ async fn conn_loop(
             if offset & ((1 << conn.page_size_bits) - 1) != 0
               || (length != (1 << conn.page_size_bits) && length != 0)
             {
-              anyhow::bail!("unaligned transactional write");
+              anyhow::bail!(
+                "unaligned transactional write, offset={}, length={}",
+                offset,
+                length
+              );
             }
             let page_id = offset >> conn.page_size_bits;
             txn
@@ -571,7 +607,7 @@ async fn conn_loop(
       }
 
       let write_guard = write_lock.clone().lock_owned().await;
-      let txn = layered_store.begin_txn()?;
+      let txn = layered_store.begin_txn().await?;
       explicit_txn = Some(Arc::new(RwLock::new(Some((txn, write_guard)))));
 
       let mut wh = wh.lock().await;
@@ -638,7 +674,7 @@ async fn conn_loop(
 
 async fn with_interrupt(
   mut interrupt: tokio::sync::watch::Receiver<()>,
-  remote: SocketAddr,
+  remote: ByteString,
   image_id: ByteString,
   op_name: &str,
   wh: Option<Rc<tokio::sync::Mutex<Pin<Box<dyn AsyncWrite + Send>>>>>,
@@ -695,7 +731,7 @@ async fn buffered_write_loop(
 
     let _guard = lock.lock().await;
 
-    let mut txn = layered_store.begin_txn()?;
+    let mut txn = layered_store.begin_txn().await?;
     while let Some(mut req) = req.take().or_else(|| rx.try_recv().ok()) {
       for (page_id, range) in IoPlannerIterator::new(page_size, req.linear_range.clone()) {
         let page = if range.start != 0 || range.end != page_size as u64 {
@@ -705,6 +741,14 @@ async fn buffered_write_loop(
             .await?
             .unwrap_or_else(|| empty_page.clone())
             .to_vec();
+          if page.len() as u64 != page_size {
+            anyhow::bail!(
+              "page size mismatch: page_id={}, actual={}, requested={}",
+              page_id,
+              page.len(),
+              page_size
+            );
+          }
           page[range.start as usize..range.end as usize]
             .copy_from_slice(&req.data[..range.clone().count()]);
           req.data = req.data.slice(range.count()..);

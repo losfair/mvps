@@ -4,6 +4,7 @@ use bytestring::ByteString;
 use futures::{StreamExt, TryStreamExt};
 
 use crate::{
+  blob_crypto::CryptoRootKey,
   blob_reader::{BlobReader, DecompressedPage, PagePresence},
   interfaces::{ImageInfo, ImageStore},
 };
@@ -16,6 +17,8 @@ pub struct ImageManager {
   pub image_id: ByteString,
   pub layers: Vec<Rc<Layer>>,
 
+  pub writer_id: Option<ByteString>,
+
   pub change_count: u64,
 }
 
@@ -25,7 +28,11 @@ pub struct Layer {
 }
 
 impl ImageManager {
-  pub async fn open(store: Rc<dyn ImageStore>, image_id: ByteString) -> anyhow::Result<Self> {
+  pub async fn open(
+    store: Rc<dyn ImageStore>,
+    image_id: ByteString,
+    decryption_keys: &[CryptoRootKey],
+  ) -> anyhow::Result<Self> {
     let image_info = store.get_image_info(&image_id).await?;
     if image_info.version != 1 {
       anyhow::bail!("unsupported image info version");
@@ -36,7 +43,7 @@ impl ImageManager {
       async move {
         Ok::<_, anyhow::Error>(Rc::new(Layer {
           blob_id: blob_id.clone(),
-          blob: BlobReader::open(store.get_blob(blob_id).await?).await?,
+          blob: BlobReader::open(store.get_blob(blob_id).await?, decryption_keys).await?,
         }))
       }
     }))
@@ -44,10 +51,18 @@ impl ImageManager {
     .try_collect::<Vec<Rc<Layer>>>()
     .await?;
 
+    tracing::info!(
+      change_count = image_info.change_count,
+      num_layers = layers.len(),
+      writer_id = image_info.writer_id.as_deref().unwrap_or_default(),
+      "opened image"
+    );
+
     Ok(Self {
       store,
       image_id,
       layers,
+      writer_id: image_info.writer_id,
       change_count: image_info.change_count,
     })
   }
@@ -79,6 +94,7 @@ impl ImageManager {
         &ImageInfo {
           version: 1,
           change_count: self.change_count,
+          writer_id: self.writer_id.clone(),
           layers: self.layers.iter().map(|x| x.blob_id.clone()).collect(),
         },
       ),
@@ -93,7 +109,7 @@ impl ImageManager {
         panic!("timed out writing back image, no longer safe to retry");
       }
     }
-    tracing::info!(image_id = %self.image_id, change_count = self.change_count, duration = ?start_time.elapsed(), "written back image");
+    tracing::info!(image_id = %self.image_id, num_layers = self.layers.len(), change_count = self.change_count, duration = ?start_time.elapsed(), "written back image");
     Ok(())
   }
 }

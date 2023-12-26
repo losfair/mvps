@@ -12,6 +12,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+base32 = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 byteorder = { workspace = true }
 bytes = { workspace = true }
@@ -25,6 +27,7 @@ humansize = { workspace = true }
 jsonwebtoken = { workspace = true }
 memmap2 = { workspace = true }
 moka = { workspace = true }
+once_cell = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 rpds = { workspace = true }
@@ -32,12 +35,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 slab = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]

@@ -5,6 +5,7 @@ use prost::Message;
 use rand::Rng;
 
 use crate::{
+  blob_crypto::CryptoRootKey,
   blob_writer::{BlobHeaderWriter, BlobHeaderWriterOptions, PageInfoInHeader},
   interfaces::ImageStore,
   util::generate_blob_id,
@@ -13,11 +14,15 @@ use crate::{
 pub async fn create_blob(
   image_store: &dyn ImageStore,
   values: &mut [(u64, Option<Bytes>)],
+  root_key: Option<&CryptoRootKey>,
 ) -> anyhow::Result<String> {
   let id = generate_blob_id();
-  let mut header = BlobHeaderWriter::new(BlobHeaderWriterOptions {
-    metadata: "".into(),
-  });
+  let mut header = BlobHeaderWriter::new(
+    BlobHeaderWriterOptions {
+      metadata: "".into(),
+    },
+    root_key,
+  );
 
   values.sort_by_key(|(page_id, _)| *page_id);
   let values = &*values;
@@ -58,11 +63,17 @@ pub async fn create_blob(
     })?;
   }
 
-  let stream = futures::stream::once(ready(Ok::<_, anyhow::Error>(header.encode())))
+  let (header, subkey) = header.encode();
+
+  let stream = futures::stream::once(ready(Ok::<_, anyhow::Error>(header)))
     .chain(futures::stream::iter(
       pages
         .iter()
-        .map(|(_, page)| Ok(page.clone()))
+        .map(|(page_id, page)| {
+          Ok(Bytes::from(
+            subkey.encrypt_with_u64_le_nonce(page.to_vec(), *page_id),
+          ))
+        })
         .collect::<Vec<_>>(),
     ))
     .boxed();

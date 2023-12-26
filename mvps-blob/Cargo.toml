@@ -12,8 +12,11 @@ async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 base32 = { workspace = true }
+base64 = { workspace = true }
+boring = { workspace = true }
 bytes = { workspace = true }
 bytestring = { workspace = true }
+chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -32,3 +35,4 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 tempdir = { workspace = true }
+aes-gcm = { workspace = true }

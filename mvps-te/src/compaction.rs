@@ -4,6 +4,7 @@ use anyhow::Context;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use mvps_blob::{
+  blob_crypto::CryptoRootKey,
   blob_reader::{BlobReader, PageMetadata},
   blob_writer::{BlobHeaderWriter, BlobHeaderWriterOptions, PageInfoInHeader},
   compaction::compact_blobs,
@@ -15,6 +16,11 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::config::CompactionThreshold;
 
+#[cfg(test)]
+thread_local! {
+  pub static TEST_LOW_TRIM_THRESHOLD: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
 #[derive(Debug)]
 struct Candidate {
   continous_from: usize,
@@ -25,6 +31,8 @@ pub async fn trim_and_compact_once(
   mut with_im: impl FnMut(&mut dyn FnMut(&mut ImageManager)),
   mut request_writeback: impl FnMut(),
   thresholds: &[CompactionThreshold],
+  root_key: Option<&CryptoRootKey>,
+  decryption_keys: &[CryptoRootKey],
 ) {
   let mut image_id = None;
   let mut image_store: Option<Rc<dyn ImageStore>> = None;
@@ -35,43 +43,7 @@ pub async fn trim_and_compact_once(
   let image_id = image_id.unwrap();
   let image_store = image_store.unwrap();
 
-  // Trim before compact
-  for trim_iteration in 0u64..64u64 {
-    let mut layers: Vec<Rc<Layer>> = vec![];
-    with_im(&mut |im| {
-      layers = im.layers.clone();
-    });
-
-    let old_layers = layers;
-    let mut num_trimmed_bytes: u64 = 0;
-    let mut new_layers = trim_once(
-      old_layers.clone(),
-      image_store.clone(),
-      &mut num_trimmed_bytes,
-    )
-    .await;
-
-    if num_trimmed_bytes == 0 {
-      break;
-    }
-
-    with_im(&mut |im| {
-      for (old, current) in old_layers.iter().zip(im.layers.iter()) {
-        assert_eq!(old.blob_id, current.blob_id);
-      }
-
-      let current_layers = std::mem::replace(&mut im.layers, vec![]);
-      let new_layers = std::mem::replace(&mut new_layers, vec![]);
-      im.layers = new_layers
-        .into_iter()
-        .chain(current_layers.into_iter().skip(old_layers.len()))
-        .collect();
-    });
-    request_writeback();
-    tracing::info!(%image_id, trim_iteration, num_trimmed_bytes, num_trimmed_bytes_pretty = humansize::format_size(num_trimmed_bytes, humansize::BINARY), "trimmed image");
-  }
-
-  // Now, do the compaction
+  // Do the compaction
   for (level, threshold) in thresholds.iter().enumerate() {
     let mut layers: Vec<Rc<Layer>> = vec![];
     with_im(&mut |im| {
@@ -147,7 +119,14 @@ pub async fn trim_and_compact_once(
         .iter()
         .map(|x| &x.blob)
         .collect::<Vec<_>>();
-      let new_layer = match compact_and_persist_layer(image_store.clone(), blobs).await {
+      let new_layer = match compact_and_persist_layer(
+        image_store.clone(),
+        blobs,
+        root_key,
+        decryption_keys,
+      )
+      .await
+      {
         Ok(x) => Rc::new(x),
         Err(e) => {
           tracing::error!(%image_id, error = ?e, ?range, ?blob_ids, "failed to compact and persist range");
@@ -185,14 +164,55 @@ pub async fn trim_and_compact_once(
       tracing::info!(%image_id, level, ?range, ?blob_ids, "range compaction complete");
     }
   }
+
+  // Trim after compact
+  for trim_iteration in 0u64..4u64 {
+    let mut layers: Vec<Rc<Layer>> = vec![];
+    with_im(&mut |im| {
+      layers = im.layers.clone();
+    });
+
+    let old_layers = layers;
+    let mut num_trimmed_bytes: u64 = 0;
+    let mut new_layers = trim_once(
+      old_layers.clone(),
+      image_store.clone(),
+      &mut num_trimmed_bytes,
+      trim_iteration as usize,
+      root_key,
+      decryption_keys,
+    )
+    .await;
+
+    if num_trimmed_bytes == 0 {
+      break;
+    }
+
+    with_im(&mut |im| {
+      for (old, current) in old_layers.iter().zip(im.layers.iter()) {
+        assert_eq!(old.blob_id, current.blob_id);
+      }
+
+      let current_layers = std::mem::replace(&mut im.layers, vec![]);
+      let new_layers = std::mem::replace(&mut new_layers, vec![]);
+      im.layers = new_layers
+        .into_iter()
+        .chain(current_layers.into_iter().skip(old_layers.len()))
+        .collect();
+    });
+    request_writeback();
+    tracing::info!(%image_id, trim_iteration, num_trimmed_bytes, num_trimmed_bytes_pretty = humansize::format_size(num_trimmed_bytes, humansize::BINARY), "trimmed image");
+  }
 }
 
 async fn compact_and_persist_layer(
   image_store: Rc<dyn ImageStore>,
   blobs: Vec<&BlobReader>,
+  root_key: Option<&CryptoRootKey>,
+  decryption_keys: &[CryptoRootKey],
 ) -> anyhow::Result<Layer> {
   let output_blob_id = generate_blob_id();
-  let output_stream = compact_blobs(blobs, "".into())
+  let output_stream = compact_blobs(blobs, "".into(), root_key)
     .await
     .with_context(|| "failed to initiate blob compaction")?;
   image_store
@@ -204,6 +224,7 @@ async fn compact_and_persist_layer(
       .get_blob(&output_blob_id)
       .await
       .with_context(|| "failed to get new blob")?,
+    decryption_keys,
   )
   .await
   .with_context(|| "failed to open new blob")?;
@@ -218,6 +239,9 @@ async fn trim_once(
   layers: Vec<Rc<Layer>>,
   image_store: Rc<dyn ImageStore>,
   num_trimmed_bytes: &mut u64,
+  start_from_seq: usize,
+  root_key: Option<&CryptoRootKey>,
+  decryption_keys: &[CryptoRootKey],
 ) -> Vec<Rc<Layer>> {
   let mut page_index_to_layer_index: HashMap<u64, usize> = HashMap::new();
 
@@ -236,6 +260,11 @@ async fn trim_once(
       continue;
     }
 
+    if layer_seq < start_from_seq {
+      new_layers.push(layer);
+      continue;
+    }
+
     let gen_referenced_pages = || {
       layer
         .blob
@@ -249,6 +278,8 @@ async fn trim_once(
       image_store.clone(),
       num_trimmed_bytes,
       gen_referenced_pages,
+      root_key,
+      decryption_keys,
     )
     .await
     {
@@ -271,12 +302,24 @@ async fn trim_layer<I: Iterator<Item = (u64, PageMetadata)>>(
   image_store: Rc<dyn ImageStore>,
   num_trimmed_bytes: &mut u64,
   gen_referenced_pages: impl Fn() -> I,
+  root_key: Option<&CryptoRootKey>,
+  decryption_keys: &[CryptoRootKey],
 ) -> anyhow::Result<Option<Rc<Layer>>> {
   let total_size = layer.blob.size() - layer.blob.body_offset();
 
   // Small layer, don't trim
-  if total_size <= 1048576 * 16 {
-    return Ok(Some(layer));
+  if total_size <= 64 * 1048576 {
+    #[cfg(test)]
+    {
+      if !TEST_LOW_TRIM_THRESHOLD.with(|x| x.get()) {
+        return Ok(Some(layer));
+      }
+    }
+
+    #[cfg(not(test))]
+    {
+      return Ok(Some(layer));
+    }
   }
 
   let referenced_size = gen_referenced_pages()
@@ -289,37 +332,38 @@ async fn trim_layer<I: Iterator<Item = (u64, PageMetadata)>>(
     return Ok(None);
   }
 
-  // At least 2/3 still referenced, keep it
-  if referenced_size >= total_size / 3 * 2 {
+  // At least 1/2 still referenced, keep it
+  if referenced_size >= total_size / 2 {
     return Ok(Some(layer));
   }
 
   // Build new blob
-  let mut header = BlobHeaderWriter::new(BlobHeaderWriterOptions {
-    metadata: layer.blob.metadata().to_owned(),
-  });
+  let mut header = BlobHeaderWriter::new(
+    BlobHeaderWriterOptions {
+      metadata: layer.blob.metadata().to_owned(),
+    },
+    root_key,
+  );
+
+  let prev_overhead = layer.blob.subkey().overhead_bytes();
+  let new_overhead = header.subkey().overhead_bytes();
 
   for (page_id, page_metadata) in gen_referenced_pages() {
+    if page_metadata.compressed_size != 0 && page_metadata.compressed_size < prev_overhead as u64 {
+      anyhow::bail!("page size less than overhead - corruption?");
+    }
+
     header.add_page(PageInfoInHeader {
       id: page_id,
-      compressed_size: page_metadata.compressed_size,
+      compressed_size: if page_metadata.compressed_size == 0 {
+        0
+      } else {
+        page_metadata.compressed_size - prev_overhead as u64 + new_overhead as u64
+      },
     })?;
   }
-  let header = header.encode();
-  let chunks = layer
-    .blob
-    .backend()
-    .clone()
-    .stream_chunks(
-      layer.blob.body_offset(),
-      layer
-        .blob
-        .page_index()
-        .values()
-        .map(|x| x.compressed_size)
-        .collect(),
-    )
-    .await?;
+  let (header, subkey) = header.encode();
+  let mut page_stream = layer.blob.stream_pages().await?;
   let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<Bytes>>(16);
   let mut tx = Some(tx);
   let tx_work = async {
@@ -330,19 +374,15 @@ async fn trim_layer<I: Iterator<Item = (u64, PageMetadata)>>(
       return;
     }
 
-    let mut stream_it = chunks.zip(futures::stream::iter(
-      layer.blob.page_index().keys().copied(),
-    ));
-
     for (page_id, _) in gen_referenced_pages() {
       let chunk = loop {
-        let Some((chunk, chunk_page_id)) = stream_it.next().await else {
+        let Some(x) = page_stream.next().await else {
           let _ = tx
             .send(Err(anyhow::anyhow!("unexpected end of stream")))
             .await;
           return;
         };
-        let chunk = match chunk {
+        let (chunk_page_id, chunk) = match x {
           Ok(x) => x,
           Err(e) => {
             let _ = tx.send(Err(e)).await;
@@ -354,7 +394,9 @@ async fn trim_layer<I: Iterator<Item = (u64, PageMetadata)>>(
         }
       };
 
-      if tx.send(Ok(chunk)).await.is_err() {
+      let chunk = subkey.encrypt_with_u64_le_nonce(chunk.to_vec(), page_id);
+
+      if tx.send(Ok(Bytes::from(chunk))).await.is_err() {
         return;
       }
     }
@@ -368,7 +410,11 @@ async fn trim_layer<I: Iterator<Item = (u64, PageMetadata)>>(
     .await
     .with_context(|| "failed to write new blob")?;
 
-  let new_reader = BlobReader::open(image_store.clone().get_blob(&new_blob_id).await?).await?;
+  let new_reader = BlobReader::open(
+    image_store.clone().get_blob(&new_blob_id).await?,
+    decryption_keys,
+  )
+  .await?;
 
   assert!(total_size > referenced_size);
   *num_trimmed_bytes += total_size - referenced_size;
