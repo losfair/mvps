@@ -3,7 +3,6 @@ on:
   push:
 jobs:
   build:
-    name: Build
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
@@ -38,7 +37,6 @@ jobs:
           name: build
           path: ./build
   test:
-    name: test
     runs-on: ubuntu-20.04
     steps:
       - name: Checkout
@@ -55,7 +53,6 @@ jobs:
       - name: Run tests
         run: cargo test --locked
   nbdstress:
-    name: nbdstress
     timeout-minutes: 10
     runs-on: ubuntu-20.04
     needs:
@@ -93,7 +90,6 @@ jobs:
             --write-percentage 0.2 --reconnect-interval-ms 10000 \
             --stop-after-reads 2000000
   release:
-    name: Release
     needs:
     - build
     - test
