@@ -58,12 +58,10 @@ mkfs.ext4 /dev/nbd0
 mount /dev/nbd0 /mnt
 ```
 
-Note that **you should never use the same image with different buffer stores**.
-Doing so causes data corruption. An exception to this rule is when the previous
-buffer store has become permanently inaccessible (e.g. deleted) - in this case,
-you can use a new buffer store, and the data that is not yet flushed to object
-storage in the previous buffer store is lost. Transactional consistency is
-preserved.
+Unless the previous buffer store is drained or has become permanently
+inaccessible, you should always use the same buffer store with an image.
+Otherwise, bad (but not _very_ bad) things happen (durability is lost, data
+remains consistent).
 
 ## Garbage collection
 
