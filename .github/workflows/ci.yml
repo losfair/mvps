@@ -56,7 +56,7 @@ jobs:
         run: cargo test --locked
   nbdstress:
     name: nbdstress
-    timeout-minutes: 30
+    timeout-minutes: 10
     runs-on: ubuntu-20.04
     needs:
     - build
@@ -91,7 +91,7 @@ jobs:
             --export-name eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpbWFnZV9pZCI6IlNUUkVTUy0wMS5tdnBzLWltYWdlIiwiaW1hZ2Vfc2l6ZSI6MjE0NzQ4MzY0OCwicGFnZV9zaXplX2JpdHMiOjEyLCJleHAiOjMwMDAwMDAwMDAsImNsaWVudF9pZCI6ImM5ZWZkOTZjLWRhNTktNDM1MS1iMzExLTM1MTI5NWZhOThlMiJ9.HjCMh3inem9WFLmPy0HOJlefD1dFxcH9YMqOLsz6R-E \
             --remote 127.0.0.1:10809 \
             --write-percentage 0.2 --reconnect-interval-ms 10000 \
-            --stop-after-reads 1000000
+            --stop-after-reads 2000000
   release:
     name: Release
     needs:
