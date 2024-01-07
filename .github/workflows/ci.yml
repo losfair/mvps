@@ -6,11 +6,12 @@ jobs:
     runs-on: ubuntu-20.04
     permissions:
       id-token: write
-      packages: write
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+      - uses: sigstore/cosign-installer@v3.3.0
+        with:
+          cosign-release: 'v2.2.2'
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -35,10 +36,12 @@ jobs:
           cp ../target/release/mvps-s3-gc ./
           cp ../target/release/nbdstress ./
           find . -type f -exec sha256sum '{}' ';'
-      - name: Attest artifact
-        uses: github-early-access/generate-build-provenance@main
-        with:
-          subject-path: '${{ github.workspace }}/build/*'
+      - name: Sign artifact
+        run: |
+          set -e
+          cosign sign-blob --yes --bundle build/mvps-te.cosign-bundle build/mvps-te
+          cosign sign-blob --yes --bundle build/mvps-s3-gc.cosign-bundle build/mvps-s3-gc
+          cosign sign-blob --yes --bundle build/nbdstress.cosign-bundle build/nbdstress
       - name: Push binaries
         uses: actions/upload-artifact@v3
         with:
