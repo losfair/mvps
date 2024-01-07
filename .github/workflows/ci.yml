@@ -4,9 +4,14 @@ on:
 jobs:
   build:
     runs-on: ubuntu-20.04
+    permissions:
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+      - uses: sigstore/cosign-installer@v3.3.0
+        with:
+          cosign-release: 'v2.2.2'
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -15,6 +20,7 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get install -y protobuf-compiler
       - name: Rust Build Cache
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: Swatinem/rust-cache@v2
       - name: Build (mvps-te)
         run: cargo build --locked --release -p mvps-te
@@ -31,6 +37,13 @@ jobs:
           cp ../target/release/mvps-s3-gc ./
           cp ../target/release/nbdstress ./
           find . -type f -exec sha256sum '{}' ';'
+      - name: Sign artifact
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          set -e
+          cosign sign-blob --yes --bundle build/mvps-te.cosign-bundle build/mvps-te
+          cosign sign-blob --yes --bundle build/mvps-s3-gc.cosign-bundle build/mvps-s3-gc
+          cosign sign-blob --yes --bundle build/nbdstress.cosign-bundle build/nbdstress
       - name: Push binaries
         uses: actions/upload-artifact@v3
         with:
@@ -106,6 +119,9 @@ jobs:
       with:
         files: |
           build/mvps-te
+          build/mvps-te.cosign-bundle
           build/mvps-s3-gc
+          build/mvps-s3-gc.cosign-bundle
           build/nbdstress
+          build/nbdstress.cosign-bundle
         prerelease: true
