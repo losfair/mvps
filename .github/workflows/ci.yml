@@ -31,6 +31,10 @@ jobs:
           cp ../target/release/mvps-s3-gc ./
           cp ../target/release/nbdstress ./
           find . -type f -exec sha256sum '{}' ';'
+      - name: Attest artifact
+        uses: github-early-access/generate-build-provenance@main
+        with:
+          subject-path: '${{ github.workspace }}/build/*'
       - name: Push binaries
         uses: actions/upload-artifact@v3
         with:
