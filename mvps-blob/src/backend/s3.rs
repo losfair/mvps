@@ -12,7 +12,7 @@ use aws_sdk_s3::{
 use bytes::{Bytes, BytesMut};
 use bytestring::ByteString;
 use chrono::{TimeZone, Utc};
-use futures::{future::Either, FutureExt, Stream, StreamExt, TryStreamExt};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
 use once_cell::sync::Lazy;
 use std::{ops::Range, pin::Pin, rc::Rc};
 use tokio::io::AsyncReadExt;
@@ -174,17 +174,35 @@ impl ImageStore for S3ImageStore {
         .upload_id()
         .ok_or_else(|| anyhow::anyhow!("Failed to get upload ID"))?;
 
-      let chunks = blob_stream
-        .flat_map(|x| match x {
-          Ok(x) => Either::Left(futures::stream::iter(x.into_iter().map(Ok))),
-          Err(e) => Either::Right(futures::stream::once(futures::future::ready(Err(e)))),
-        })
-        .try_chunks(PART_SIZE);
+      let mut rx = StreamReader::new(blob_stream.map(|x| match x {
+        Ok(x) => Ok::<_, std::io::Error>(x),
+        Err(e) => {
+          tracing::error!(error = ?e, "Failed to read blob stream");
+          Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+        }
+      }));
 
+      let chunks = async_stream::try_stream! {
+        loop {
+          let mut buf = vec![0; PART_SIZE];
+          let mut cursor = 0usize;
+          while cursor < PART_SIZE {
+            let n = rx.read(&mut buf[cursor..]).await?;
+            if n == 0 {
+              break;
+            }
+            cursor += n;
+          }
+          if cursor == 0 {
+            break;
+          }
+          buf.truncate(cursor);
+          yield Bytes::from(buf);
+        }
+      };
       let completed_parts = chunks
         .enumerate()
         .map(|(i, x)| x.map(|x| (i + 1, x)))
-        .map_err(anyhow::Error::from)
         .map_ok(|(part_number, chunk)| {
           let client = &client;
           let bucket = &bucket;
