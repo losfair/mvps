@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use aes_gcm::{aead::Aead, Aes256Gcm};
 use base64::Engine;
 use chacha20poly1305::{
   aead::{generic_array::typenum::Unsigned, OsRng},
@@ -178,22 +179,15 @@ impl CryptoSubKey {
           .unwrap();
         output
       }
-      CryptoSubKeyInner::Aes256Gcm(key) => {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..8].copy_from_slice(&nonce.to_le_bytes());
-        let mut tag = [0u8; 16];
-        let mut output = boring::symm::encrypt_aead(
-          boring::symm::Cipher::aes_256_gcm(),
-          key,
-          Some(&nonce_bytes),
-          &[],
-          &plaintext,
-          &mut tag,
+      CryptoSubKeyInner::Aes256Gcm(key) => Aes256Gcm::new_from_slice(key)
+        .unwrap()
+        .encrypt(
+          [&nonce.to_le_bytes()[..], &[0u8; 4]].concat()[..]
+            .try_into()
+            .unwrap(),
+          &plaintext[..],
         )
-        .unwrap();
-        output.extend_from_slice(&tag);
-        output
-      }
+        .unwrap(),
     }
   }
 
@@ -215,23 +209,17 @@ impl CryptoSubKey {
           .map_err(|_| anyhow::anyhow!("decrypt failed"))?;
         Ok(output)
       }
-      CryptoSubKeyInner::Aes256Gcm(key) => {
-        if ciphertext.len() < 16 {
-          anyhow::bail!("ciphertext too short");
-        }
-
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[..8].copy_from_slice(&nonce.to_le_bytes());
-        let out = boring::symm::decrypt_aead(
-          boring::symm::Cipher::aes_256_gcm(),
-          key,
-          Some(&nonce_bytes),
-          &[],
-          &ciphertext[..ciphertext.len() - 16],
-          &ciphertext[ciphertext.len() - 16..],
-        )?;
-        Ok(out)
-      }
+      CryptoSubKeyInner::Aes256Gcm(key) => Ok(
+        Aes256Gcm::new_from_slice(key)
+          .unwrap()
+          .decrypt(
+            [&nonce.to_le_bytes()[..], &[0u8; 4]].concat()[..]
+              .try_into()
+              .unwrap(),
+            &ciphertext[..],
+          )
+          .map_err(|_| anyhow::anyhow!("decrypt failed"))?,
+      ),
     }
   }
 }
@@ -309,7 +297,6 @@ mod tests {
       _ => unreachable!(),
     };
 
-    // Use a different AES implementation (`aes-gcm`) to validate data encryption/decryption correctness
     {
       let encrypted = subkey.encrypt_with_u64_le_nonce(data.to_vec(), nonce);
 
