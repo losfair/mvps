@@ -22,6 +22,7 @@ pub struct LayeredStoreConfig {
   pub compaction_thresholds: Vec<CompactionThreshold>,
   pub compaction_interval: JitteredInterval,
   pub disable_image_store_write: bool,
+  pub disable_compression: bool,
 }
 
 impl Default for LayeredStoreConfig {
@@ -76,6 +77,7 @@ impl Default for LayeredStoreConfig {
         jitter_ms: 10000,
       },
       disable_image_store_write: false,
+      disable_compression: false,
     }
   }
 }

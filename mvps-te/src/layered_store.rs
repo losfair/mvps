@@ -328,6 +328,7 @@ async fn checkpoint_once(me: Rc<Inner>, bs: Arc<BufferStore>) -> anyhow::Result<
   let bs2 = bs.clone();
   let start_time = Instant::now();
   let root_key = me.root_key.clone();
+  let disable_compression = me.config.disable_compression;
   let (page_change_counts, tempfile, snapshot_change_count, header) = spawn_blocking(move || {
     let snapshot = bs2.snapshot_for_checkpoint()?;
 
@@ -344,9 +345,16 @@ async fn checkpoint_once(me: Rc<Inner>, bs: Arc<BufferStore>) -> anyhow::Result<
       let (page_id, change_count, data) = x?;
       page_change_counts.push((page_id, change_count));
       if let Some(data) = data {
-        let data = BlobPage {
-          compression: BlobPageCompressionMethod::BpcmZstd.into(),
-          data: Bytes::from(zstd::encode_all(&data[..], 0).unwrap()),
+        let data = if disable_compression {
+          BlobPage {
+            compression: BlobPageCompressionMethod::BpcmNone.into(),
+            data,
+          }
+        } else {
+          BlobPage {
+            compression: BlobPageCompressionMethod::BpcmZstd.into(),
+            data: Bytes::from(zstd::encode_all(&data[..], 0).unwrap()),
+          }
         }
         .encode_to_vec();
         let data = header.subkey().encrypt_with_u64_le_nonce(data, page_id);

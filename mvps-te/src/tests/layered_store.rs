@@ -49,6 +49,7 @@ async fn test_layered_store() {
               jitter_ms: 10,
             },
             disable_image_store_write: false,
+            disable_compression: false,
           },
           root_key.clone(),
           decryption_keys.clone(),
@@ -176,6 +177,7 @@ async fn test_compaction() {
                 jitter_ms: 10,
               },
               disable_image_store_write: false,
+              disable_compression: false,
             },
             root_key.clone(),
             decryption_keys.clone(),
@@ -337,6 +339,7 @@ async fn test_compact_unencrypted_pages_to_encrypted() {
                   jitter_ms: 10,
                 },
                 disable_image_store_write: false,
+                disable_compression: false,
               },
               if encrypted {
                 root_key.clone()
@@ -479,6 +482,7 @@ async fn test_trim_unencrypted_to_encrypted() {
                 jitter_ms: 10,
               },
               disable_image_store_write: false,
+              disable_compression: false,
             },
             if encrypted {
               root_key.clone()

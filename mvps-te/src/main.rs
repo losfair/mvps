@@ -141,6 +141,10 @@ struct Args {
   #[clap(long)]
   disable_image_store_write: bool,
 
+  /// Disable compression
+  #[clap(long)]
+  disable_compression: bool,
+
   /// Root key
   #[clap(long, env = "MVPS_TE_ROOT_KEY")]
   root_key: Option<String>,
@@ -270,6 +274,7 @@ async fn async_main() -> anyhow::Result<()> {
     bs_env: Some(bs_env),
     layered_store_config: LayeredStoreConfig {
       disable_image_store_write: args.disable_image_store_write,
+      disable_compression: args.disable_compression,
       ..LayeredStoreConfig::default()
     },
     checkpoint_interval: JitteredInterval {
