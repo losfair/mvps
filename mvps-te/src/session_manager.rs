@@ -423,8 +423,8 @@ async fn conn_loop(
     let offset = conn.io_rh.read_u64().await?;
     let length = conn.io_rh.read_u32().await?;
 
-    if length > 1048576 {
-      anyhow::bail!("request length too large");
+    if length > 1048576 * 8 {
+      anyhow::bail!("request length too large: {}", length);
     }
 
     let Some(linear_end) = offset.checked_add(length as u64) else {
