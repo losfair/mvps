@@ -315,9 +315,15 @@ async fn checkpoint_loop(
     };
 
     let seq = *checkpoint_req_rx.borrow_and_update();
-    if let Err(e) = checkpoint_once(me, bs.clone()).await {
-      tracing::error!(error = ?e, "failed to checkpoint");
-      continue;
+
+    loop {
+      if let Err(e) = checkpoint_once(me.clone(), bs.clone()).await {
+        tracing::error!(error = ?e, "failed to checkpoint, retrying in 5 seconds");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        continue;
+      }
+
+      break;
     }
 
     let _ = checkpoint_ack_tx.send(seq);
