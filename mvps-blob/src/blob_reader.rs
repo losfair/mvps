@@ -177,19 +177,21 @@ impl BlobReader {
     &self,
   ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<(u64, Bytes)>> + Send + 'static>>>
   {
+    let non_tombstone_pages: Vec<(u64, u64)> = self
+      .page_index
+      .iter()
+      .filter(|(_, m)| m.compressed_size != 0)
+      .map(|(id, m)| (*id, m.compressed_size))
+      .collect();
+
+    let chunk_sizes: Vec<u64> = non_tombstone_pages.iter().map(|(_, s)| *s).collect();
+    let page_ids: Vec<u64> = non_tombstone_pages.iter().map(|(id, _)| *id).collect();
+
     let backend_stream = self
       .backend
       .clone()
-      .stream_raw_chunks(
-        self.body_offset,
-        self
-          .page_index
-          .iter()
-          .map(|x| x.1.compressed_size)
-          .collect::<Vec<_>>(),
-      )
+      .stream_raw_chunks(self.body_offset, chunk_sizes)
       .await?;
-    let page_ids = self.page_index.keys().copied().collect::<Vec<_>>();
     let subkey = self.subkey.clone();
 
     Ok(

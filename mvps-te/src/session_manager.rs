@@ -14,7 +14,6 @@ use bytes::Bytes;
 use bytestring::ByteString;
 use futures::{future::Either, Future, FutureExt, StreamExt, TryStreamExt};
 use governor::{Quota, RateLimiter};
-use heed::Env;
 use mvps_blob::{
   backend::local_fs::LocalFsImageStore, blob_crypto::CryptoRootKey, interfaces::ImageStore,
   util::is_valid_image_id,
@@ -46,7 +45,7 @@ pub struct SessionManager {
 #[derive(Clone)]
 pub struct SessionManagerConfig {
   pub image_store_provider: ImageStoreProvider,
-  pub bs_env: Option<Env>,
+  pub buffer_store_path: Option<PathBuf>,
   pub layered_store_config: LayeredStoreConfig,
   pub checkpoint_interval: JitteredInterval,
   pub image_cache_size: u64,
@@ -84,7 +83,7 @@ impl SessionManager {
     }
   }
 
-  pub fn get_session(&self, image_id: ByteString) -> anyhow::Result<SessionHandle> {
+  pub fn get_session(&self, image_id: ByteString, page_size_bits: u32) -> anyhow::Result<SessionHandle> {
     if !is_valid_image_id(&image_id) {
       anyhow::bail!("invalid image id");
     }
@@ -93,44 +92,57 @@ impl SessionManager {
     let Some(sessions) = &mut *sessions else {
       anyhow::bail!("session manager is shutting down");
     };
-    let session = sessions.entry(image_id.clone()).or_insert_with(|| {
-      let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(1);
-      let (shutdown_tx, shutdown_rx) = oneshot::channel();
-      let config = Arc::new(SessionConfig {
-        image_id: image_id.clone(),
-        image_store_provider: self.config.image_store_provider.clone(),
-        bs_env: self.config.bs_env.clone(),
-        layered_store_config: self.config.layered_store_config.clone(),
-        checkpoint_interval: self.config.checkpoint_interval,
-        image_cache_size: self.config.image_cache_size,
-        image_cache_block_size: self.config.image_cache_block_size,
-        write_throttle_threshold_pages: self.config.write_throttle_threshold_pages,
-        root_key: self.config.root_key.clone(),
-        decryption_keys: self.config.decryption_keys.clone(),
-      });
-      let inner = Arc::new(SessionInner {});
-      let handle = std::thread::Builder::new()
-        .name(format!("i-{}", image_id))
-        .spawn(move || {
-          let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .thread_name(format!("w-{}", image_id))
-            .max_blocking_threads(4)
-            .build()
-            .unwrap();
-          let local_set = tokio::task::LocalSet::new();
-          local_set.block_on(&rt, session_loop(inner, config, conn_rx, shutdown_rx));
-        })
-        .unwrap();
-      Session {
-        conn_tx,
-        _shutdown_tx: shutdown_tx,
-        handle,
+    if let Some(session) = sessions.get(&image_id) {
+      if session.page_size_bits != page_size_bits {
+        anyhow::bail!(
+          "page size mismatch for image {}: session has {}, connection has {}",
+          image_id,
+          session.page_size_bits,
+          page_size_bits
+        );
       }
+      return Ok(SessionHandle {
+        conn_tx: session.conn_tx.clone(),
+      });
+    }
+
+    let (conn_tx, conn_rx) = tokio::sync::mpsc::channel(1);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let config = Arc::new(SessionConfig {
+      image_id: image_id.clone(),
+      image_store_provider: self.config.image_store_provider.clone(),
+      buffer_store_path: self.config.buffer_store_path.clone(),
+      layered_store_config: self.config.layered_store_config.clone(),
+      checkpoint_interval: self.config.checkpoint_interval,
+      image_cache_size: self.config.image_cache_size,
+      image_cache_block_size: self.config.image_cache_block_size,
+      write_throttle_threshold_pages: self.config.write_throttle_threshold_pages,
+      root_key: self.config.root_key.clone(),
+      decryption_keys: self.config.decryption_keys.clone(),
     });
-    Ok(SessionHandle {
-      conn_tx: session.conn_tx.clone(),
-    })
+    let inner = Arc::new(SessionInner {});
+    let image_id_clone = image_id.clone();
+    let handle = std::thread::Builder::new()
+      .name(format!("i-{}", image_id))
+      .spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+          .enable_all()
+          .thread_name(format!("w-{}", image_id_clone))
+          .max_blocking_threads(4)
+          .build()
+          .unwrap();
+        let local_set = tokio::task::LocalSet::new();
+        local_set.block_on(&rt, session_loop(inner, config, conn_rx, shutdown_rx));
+      })
+      .unwrap();
+    let session = Session {
+      conn_tx: conn_tx.clone(),
+      _shutdown_tx: shutdown_tx,
+      handle,
+      page_size_bits,
+    };
+    sessions.insert(image_id, session);
+    Ok(SessionHandle { conn_tx })
   }
 }
 
@@ -138,6 +150,7 @@ struct Session {
   conn_tx: Sender<EstablishedConn>,
   _shutdown_tx: oneshot::Sender<()>,
   handle: std::thread::JoinHandle<()>,
+  page_size_bits: u32,
 }
 
 pub struct SessionHandle {
@@ -158,7 +171,7 @@ impl SessionHandle {
 struct SessionConfig {
   image_id: ByteString,
   image_store_provider: ImageStoreProvider,
-  bs_env: Option<Env>,
+  buffer_store_path: Option<PathBuf>,
   layered_store_config: LayeredStoreConfig,
   checkpoint_interval: JitteredInterval,
   image_cache_size: u64,
@@ -225,7 +238,7 @@ async fn session_loop(
     match LayeredStore::new(
       image_store,
       config.image_id.clone(),
-      config.bs_env.clone(),
+      config.buffer_store_path.clone(),
       config.layered_store_config.clone(),
       config.root_key.clone(),
       config.decryption_keys.clone(),

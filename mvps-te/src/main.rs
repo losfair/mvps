@@ -24,7 +24,6 @@ use anyhow::Context;
 use bytestring::ByteString;
 use clap::Parser;
 use futures::future::Either;
-use heed::{flags::Flags, EnvOpenOptions};
 use jsonwebtoken::DecodingKey;
 use mvps_blob::blob_crypto::{CryptoRootKey, SubkeyAlgorithm};
 use tokio::{
@@ -76,26 +75,6 @@ struct Args {
   /// Path to buffer store
   #[clap(long, env = "MVPS_TE_BUFFER_STORE_PATH")]
   buffer_store_path: Option<String>,
-
-  /// LMDB max DBs
-  #[clap(long, default_value = "16384", env = "MVPS_TE_LMDB_MAX_DBS")]
-  lmdb_max_dbs: u32,
-
-  /// LMDB max readers
-  #[clap(long, default_value = "2048", env = "MVPS_TE_LMDB_MAX_READERS")]
-  lmdb_max_readers: u32,
-
-  /// LMDB map size
-  #[clap(
-    long,
-    default_value = "17179869184",
-    env = "MVPS_TE_LMDB_MAP_SIZE_BYTES"
-  )]
-  lmdb_map_size_bytes: usize,
-
-  /// LMDB NOSYNC flag
-  #[clap(long)]
-  lmdb_nosync: bool,
 
   /// JWT secret
   #[clap(long, env = "MVPS_TE_JWT_SECRET")]
@@ -212,28 +191,8 @@ async fn async_main() -> anyhow::Result<()> {
     .buffer_store_path
     .as_ref()
     .or_else(|| args.wal_path.as_ref())
-    .ok_or_else(|| anyhow::anyhow!("buffer store path is required"))?;
-
-  let bs_env = unsafe {
-    let mut opts = EnvOpenOptions::new();
-    opts
-      .max_dbs(args.lmdb_max_dbs)
-      .max_readers(args.lmdb_max_readers)
-      .map_size(args.lmdb_map_size_bytes)
-      .flag(Flags::MdbNoTls);
-    if args.lmdb_nosync {
-      opts.flag(Flags::MdbNoSync);
-    }
-    opts
-  }
-  .open(buffer_store_path)
-  .map_err(|e| {
-    anyhow::anyhow!(
-      "failed to open buffer store environment at {}: {:?}",
-      buffer_store_path,
-      e
-    )
-  })?;
+    .ok_or_else(|| anyhow::anyhow!("buffer store path is required"))?
+    .clone();
   let nbd_listener = if let Some(path) = args.listen.strip_prefix("unix:") {
     let _ = std::fs::remove_file(path);
     Either::Left(UnixListener::bind(path)?)
@@ -271,7 +230,7 @@ async fn async_main() -> anyhow::Result<()> {
 
   let session_manager = Arc::new(SessionManager::new(SessionManagerConfig {
     image_store_provider,
-    bs_env: Some(bs_env),
+    buffer_store_path: Some(std::path::PathBuf::from(buffer_store_path)),
     layered_store_config: LayeredStoreConfig {
       disable_image_store_write: args.disable_image_store_write,
       disable_compression: args.disable_compression,
@@ -378,7 +337,7 @@ async fn async_main() -> anyhow::Result<()> {
           return;
         }
       };
-      let session = match session_manager.get_session(conn.image_id.clone()) {
+      let session = match session_manager.get_session(conn.image_id.clone(), conn.page_size_bits) {
         Ok(x) => x,
         Err(e) => {
           tracing::error!(error = ?e, ?remote, image_id = %conn.image_id, "failed to get session");

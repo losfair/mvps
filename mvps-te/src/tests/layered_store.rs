@@ -3,7 +3,6 @@ use std::{rc::Rc, sync::Arc, time::Duration};
 use base64::Engine;
 use bytes::Bytes;
 use bytestring::ByteString;
-use heed::EnvOpenOptions;
 use mvps_blob::{
   backend::local_fs::LocalFsImageStore,
   blob_crypto::{CryptoRootKey, SubkeyAlgorithm},
@@ -30,18 +29,14 @@ async fn test_layered_store() {
       let dir = TempDir::new("mvps-test").unwrap();
       let image_store = Rc::new(LocalFsImageStore::new(dir.path().to_path_buf()).unwrap());
       let image_id = ByteString::from(generate_image_id());
-      std::fs::create_dir_all(dir.path().join("buffer")).unwrap();
-      let env = EnvOpenOptions::new()
-        .max_dbs(16384)
-        .open(dir.path().join("buffer"))
-        .unwrap();
+      let buffer_path = dir.path().join("buffer");
       let (root_key, decryption_keys) = random_keyset();
 
       let open_layered_store = || async {
         LayeredStore::new(
           image_store.clone(),
           image_id.clone(),
-          Some(env.clone()),
+          Some(buffer_path.clone()),
           LayeredStoreConfig {
             compaction_thresholds: vec![],
             compaction_interval: JitteredInterval {
@@ -140,22 +135,18 @@ async fn test_compaction() {
       let dir = TempDir::new("mvps-test").unwrap();
       let image_store = Rc::new(LocalFsImageStore::new(dir.path().to_path_buf()).unwrap());
       let image_id = ByteString::from(generate_image_id());
-      std::fs::create_dir_all(dir.path().join("buffer")).unwrap();
-      let env = EnvOpenOptions::new()
-        .max_dbs(16384)
-        .open(dir.path().join("buffer"))
-        .unwrap();
+      let buffer_path = dir.path().join("buffer");
       let (root_key, decryption_keys) = random_keyset();
       let open_layered_store = |image_id: ByteString, num_compaction_levels: usize| {
         let image_store = &image_store;
-        let env = &env;
+        let buffer_path = &buffer_path;
         let root_key = &root_key;
         let decryption_keys = &decryption_keys;
         async move {
           LayeredStore::new(
             image_store.clone(),
             image_id.clone(),
-            Some(env.clone()),
+            Some(buffer_path.clone()),
             LayeredStoreConfig {
               compaction_thresholds: [
                 CompactionThreshold {
@@ -309,23 +300,19 @@ async fn test_compact_unencrypted_pages_to_encrypted() {
       let dir = TempDir::new("mvps-test").unwrap();
       let image_store = Rc::new(LocalFsImageStore::new(dir.path().to_path_buf()).unwrap());
       let image_id = ByteString::from(generate_image_id());
-      std::fs::create_dir_all(dir.path().join("buffer")).unwrap();
-      let env = EnvOpenOptions::new()
-        .max_dbs(16384)
-        .open(dir.path().join("buffer"))
-        .unwrap();
+      let buffer_path = dir.path().join("buffer");
       let (root_key, decryption_keys) = xchacha20poly1305_keyset(random_subkey_alg());
       let open_layered_store =
         |image_id: ByteString, num_compaction_levels: usize, encrypted: bool| {
           let image_store = &image_store;
-          let env = &env;
+          let buffer_path = &buffer_path;
           let root_key = &root_key;
           let decryption_keys = &decryption_keys;
           async move {
             LayeredStore::new(
               image_store.clone(),
               image_id.clone(),
-              Some(env.clone()),
+              Some(buffer_path.clone()),
               LayeredStoreConfig {
                 compaction_thresholds: [CompactionThreshold {
                   max_input_size: 9 * 1024,
@@ -459,22 +446,18 @@ async fn test_trim_unencrypted_to_encrypted() {
       let dir = TempDir::new("mvps-test").unwrap();
       let image_store = Rc::new(LocalFsImageStore::new(dir.path().to_path_buf()).unwrap());
       let image_id = ByteString::from(generate_image_id());
-      std::fs::create_dir_all(dir.path().join("buffer")).unwrap();
-      let env = EnvOpenOptions::new()
-        .max_dbs(16384)
-        .open(dir.path().join("buffer"))
-        .unwrap();
+      let buffer_path = dir.path().join("buffer");
       let (root_key, decryption_keys) = xchacha20poly1305_keyset(random_subkey_alg());
       let open_layered_store = |image_id: ByteString, encrypted: bool| {
         let image_store = &image_store;
-        let env = &env;
+        let buffer_path = &buffer_path;
         let root_key = &root_key;
         let decryption_keys = &decryption_keys;
         async move {
           LayeredStore::new(
             image_store.clone(),
             image_id.clone(),
-            Some(env.clone()),
+            Some(buffer_path.clone()),
             LayeredStoreConfig {
               compaction_thresholds: vec![],
               compaction_interval: JitteredInterval {

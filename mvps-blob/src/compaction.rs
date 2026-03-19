@@ -81,6 +81,9 @@ pub async fn compact_blobs<T: AsRef<BlobReader>>(
     yield new_header;
 
     for (page_id, entry) in &page_index {
+      if entry.metadata.compressed_size == 0 {
+        continue; // tombstone — no body bytes
+      }
       let cursor = &mut cursors[entry.blob_seq];
       let raw_page = loop {
         let Some(chunk) = cursor.stream.next().await else {

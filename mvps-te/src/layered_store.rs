@@ -9,7 +9,6 @@ use std::{
 use bytes::Bytes;
 use bytestring::ByteString;
 use futures::{future::ready, StreamExt, TryStreamExt};
-use heed::Env;
 use mvps_blob::{
   blob_crypto::CryptoRootKey,
   blob_reader::{BlobReader, PagePresence},
@@ -56,7 +55,7 @@ impl LayeredStore {
   pub async fn new(
     image_store: Rc<dyn ImageStore>,
     image_id: ByteString,
-    env: Option<Env>,
+    buffer_store_path: Option<std::path::PathBuf>,
     config: LayeredStoreConfig,
     root_key: Arc<Option<CryptoRootKey>>,
     decryption_keys: Arc<Vec<CryptoRootKey>>,
@@ -68,8 +67,8 @@ impl LayeredStore {
 
     let shutdown = Rc::new(RwLock::new(()));
 
-    let bs = if let Some(env) = env {
-      Some(Arc::new(BufferStore::new(env, image_id.clone())?))
+    let bs = if let Some(path) = buffer_store_path {
+      Some(Arc::new(BufferStore::new(path, image_id.clone())?))
     } else {
       None
     };

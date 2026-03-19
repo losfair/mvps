@@ -65,6 +65,50 @@ struct Metrics {
   total_writes: u64,
 }
 
+fn spawn_recv_task(
+  conn: Rc<EstablishedConn>,
+  reconnect_tx: Rc<watch::Sender<u64>>,
+) -> JoinHandle<()> {
+  spawn_local(async move {
+    tracing::info!(conn_id = conn.id, "recv_task got new connection");
+    let mut rh = conn.read_half.borrow_mut().take().unwrap();
+    let ret: anyhow::Result<()> = async {
+      loop {
+        let magic = rh.read_u32().await?;
+        assert_eq!(magic, 0x67446698);
+        let error = rh.read_u32().await?;
+        assert_eq!(error, 0);
+        let cookie = rh.read_u64().await?;
+        let (num_bytes, tx) = conn
+          .cookie_to_tx
+          .borrow_mut()
+          .remove(&cookie)
+          .ok_or_else(|| anyhow::anyhow!("cookie not found"))?;
+        let mut bytes = vec![0u8; num_bytes as usize];
+        rh.read_exact(&mut bytes).await?;
+        let _ = tx.send(Bytes::from(bytes));
+      }
+    }
+    .await;
+    tracing::error!(conn_id = conn.id, error = ?ret, "recv_task failed, reconnecting");
+    reconnect_tx.send_if_modified(|x| {
+      if conn.id > *x {
+        *x = conn.id;
+        true
+      } else {
+        false
+      }
+    });
+  })
+}
+
+async fn retire_conn(conn: &Rc<EstablishedConn>) {
+  let pending = conn.cookie_to_tx.borrow_mut().drain().count();
+  let mut wh = conn.write_half.lock().await;
+  let _ = wh.shutdown().await;
+  tracing::info!(conn_id = conn.id, pending, "retired connection");
+}
+
 fn main() -> anyhow::Result<()> {
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all()
@@ -89,6 +133,7 @@ async fn async_main() -> anyhow::Result<()> {
   let reconnect_tx = Rc::new(reconnect_tx);
   let (conn_tx, mut conn_rx) = watch::channel(None::<Rc<EstablishedConn>>);
 
+  let reconnect_tx_2 = reconnect_tx.clone();
   let handshake_task = spawn_local(async move {
     let handshake_once = || async {
       let conn = TcpStream::connect(args.remote).await?;
@@ -98,6 +143,8 @@ async fn async_main() -> anyhow::Result<()> {
       let conn = handshake(Box::pin(rh), Box::pin(wh), &args.export_name).await?;
       Ok::<_, anyhow::Error>(conn)
     };
+    let mut current_conn = None;
+    let mut current_recv_task = None;
     loop {
       let conn = match handshake_once().await {
         Ok(x) => x,
@@ -108,11 +155,19 @@ async fn async_main() -> anyhow::Result<()> {
         }
       };
       tracing::info!(conn.export_size, "connection established");
+      let conn = Rc::new(conn);
       let id = conn.id;
+      let recv_task = spawn_recv_task(conn.clone(), reconnect_tx_2.clone());
       conn_tx
-        .send(Some(Rc::new(conn)))
+        .send(Some(conn.clone()))
         .map_err(|_| ())
         .expect("conn_rx closed");
+      if let Some(prev_recv_task) = current_recv_task.replace(recv_task) {
+        prev_recv_task.abort();
+      }
+      if let Some(prev_conn) = current_conn.replace(conn) {
+        retire_conn(&prev_conn).await;
+      }
       while *reconnect_rx.borrow() != id {
         reconnect_rx.changed().await.expect("reconnect_rx closed");
       }
@@ -250,46 +305,6 @@ async fn async_main() -> anyhow::Result<()> {
     tasks.push(task);
   }
 
-  let mut conn_rx_2 = conn_rx.clone();
-  let reconnect_tx_2 = reconnect_tx.clone();
-  let recv_task = spawn_local(async move {
-    loop {
-      let conn = conn_rx_2.borrow().clone().unwrap();
-      tracing::info!(conn_id = conn.id, "recv_task got new connection");
-      let mut rh = conn.read_half.borrow_mut().take().unwrap();
-      let ret: anyhow::Result<()> = async {
-        loop {
-          let magic = rh.read_u32().await?;
-          assert_eq!(magic, 0x67446698);
-          let error = rh.read_u32().await?;
-          assert_eq!(error, 0);
-          let cookie = rh.read_u64().await?;
-          let (num_bytes, tx) = conn
-            .cookie_to_tx
-            .borrow_mut()
-            .remove(&cookie)
-            .ok_or_else(|| anyhow::anyhow!("cookie not found"))?;
-          let mut bytes = vec![0u8; num_bytes as usize];
-          rh.read_exact(&mut bytes).await?;
-          let _ = tx.send(Bytes::from(bytes));
-        }
-      }
-      .await;
-      tracing::error!(error = ?ret, "recv_task failed, reconnecting");
-      reconnect_tx_2.send_if_modified(|x| {
-        if conn.id > *x {
-          *x = conn.id;
-          true
-        } else {
-          false
-        }
-      });
-      drop(conn);
-      conn_rx_2.changed().await.unwrap();
-    }
-  });
-  tasks.push(recv_task);
-
   tasks.push(handshake_task);
 
   let conn_rx_2 = conn_rx.clone();
@@ -300,9 +315,14 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     loop {
+      let jitter_ms = args.reconnect_interval_ms / 10;
       let interval = Duration::from_millis(
         args.reconnect_interval_ms
-          + rand::thread_rng().gen_range(0..args.reconnect_interval_ms / 10),
+          + if jitter_ms > 0 {
+            rand::thread_rng().gen_range(0..jitter_ms)
+          } else {
+            0
+          },
       );
       tokio::time::sleep(interval).await;
       let conn = conn_rx_2.borrow().clone().unwrap();
